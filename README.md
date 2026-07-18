@@ -140,6 +140,7 @@ environment:
 ### 实验性 / 规划中
 
 - 详细状态说明见：[功能清单](./docs/feature-status.en.md)
+- Gemini 网页文生图 / 图生图反代见：[MVP 开发计划](./docs/gemini-web-image-proxy-mvp.md)
 
 ## 效果展示
 
