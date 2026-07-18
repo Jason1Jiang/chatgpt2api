@@ -31,6 +31,7 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   createAccounts,
   finishOAuthLogin,
+  importGeminiWebAccount,
   startOAuthLogin,
   type Account,
   type AccountImportPayload,
@@ -38,7 +39,7 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-type ImportMethod = "menu" | "token" | "session" | "codex-auth" | "account-json" | "oauth";
+type ImportMethod = "menu" | "token" | "session" | "codex-auth" | "account-json" | "oauth" | "gemini-web";
 
 type AccountImportDialogProps = {
   disabled?: boolean;
@@ -187,6 +188,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   const [tokenInput, setTokenInput] = useState("");
   const [sessionInput, setSessionInput] = useState("");
   const [codexAuthInput, setCodexAuthInput] = useState("");
+  const [geminiCookieInput, setGeminiCookieInput] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [pendingAccountJsonImport, setPendingAccountJsonImport] = useState<PendingAccountJsonImport | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -197,12 +199,14 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
 
   const txtInputRef = useRef<HTMLInputElement | null>(null);
   const accountJsonInputRef = useRef<HTMLInputElement | null>(null);
+  const geminiCookieInputRef = useRef<HTMLInputElement | null>(null);
 
   const resetState = () => {
     setMethod("menu");
     setTokenInput("");
     setSessionInput("");
     setCodexAuthInput("");
+    setGeminiCookieInput("");
     setPendingAccountJsonImport(null);
     setConfirmOpen(false);
     setOauthEmailHint("");
@@ -400,6 +404,41 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
     }
   };
 
+  const handleImportGeminiWeb = async () => {
+    if (!geminiCookieInput.trim()) {
+      toast.error("请先粘贴或上传 Cookie JSON");
+      return;
+    }
+    setIsSubmitting(true);
+    try {
+      const payload = JSON.parse(geminiCookieInput) as unknown;
+      const data = await importGeminiWebAccount(payload);
+      onImported(data.items);
+      setOpen(false);
+      resetState();
+      toast.success(`Gemini Web 账号已验证并导入：${data.item.email ?? data.item.session_label ?? "Gemini Session"}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Gemini Web Cookie JSON 导入失败";
+      toast.error(message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleGeminiCookieSelected = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const content = await readFileAsText(file);
+      JSON.parse(content);
+      setGeminiCookieInput(content);
+      toast.success(`已读取 ${file.name}`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "读取 Cookie JSON 失败");
+    }
+  };
+
   const handleAccountJsonSelected = async (event: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files ?? []);
     event.target.value = "";
@@ -444,6 +483,53 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   };
 
   const renderMethodBody = () => {
+    if (method === "gemini-web") {
+      return (
+        <div className="space-y-4">
+          <button
+            type="button"
+            onClick={() => setMethod("menu")}
+            className="inline-flex items-center gap-1 text-sm text-stone-500 transition hover:text-stone-800"
+          >
+            <ArrowLeft className="size-4" />
+            返回导入方式
+          </button>
+          <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-900">
+            <div className="font-medium">未公开网页协议</div>
+            <div>Gemini Web Cookie 等同 Google 登录凭据，协议可能变化或触发风控。请使用独立的非主力账号。</div>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-stone-700">Cookie JSON</label>
+            <Textarea
+              placeholder='粘贴 Cookie 字典、包含 "cookies" 的对象，或浏览器扩展导出的 Cookie 数组...'
+              value={geminiCookieInput}
+              onChange={(event) => setGeminiCookieInput(event.target.value)}
+              className="min-h-56 resize-none rounded-xl border-stone-200 font-mono text-xs"
+            />
+          </div>
+          <div className="rounded-2xl border border-dashed border-stone-200 bg-stone-50 p-4">
+            <Button
+              type="button"
+              variant="outline"
+              className="rounded-xl border-stone-200 bg-white"
+              onClick={() => geminiCookieInputRef.current?.click()}
+              disabled={isSubmitting}
+            >
+              <FileJson className="size-4" />
+              选择 Cookie JSON
+            </Button>
+          </div>
+          <input
+            ref={geminiCookieInputRef}
+            type="file"
+            accept=".json,application/json"
+            className="hidden"
+            onChange={(event) => void handleGeminiCookieSelected(event)}
+          />
+        </div>
+      );
+    }
+
     if (method === "token") {
       const tokenCount = splitTokens(tokenInput).length;
 
@@ -715,6 +801,12 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
     return (
       <div className="space-y-3">
         <MethodCard
+          title="导入 Gemini 网页账号"
+          description="粘贴或上传 Google Cookie JSON，导入时立即验证登录态。"
+          icon={FileJson}
+          onClick={() => setMethod("gemini-web")}
+        />
+        <MethodCard
           title="OAuth 登录已有账号（带自动刷新）"
           description="用浏览器登录自己的 ChatGPT 账号，回填 callback URL 即可拿到 refresh_token，后台会自动续期。"
           icon={LogIn}
@@ -790,8 +882,10 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                   ? "导入 Access Token"
                   : method === "session"
                     ? "导入 Session JSON"
-                    : method === "codex-auth"
+                : method === "codex-auth"
                       ? "导入 Codex 认证 JSON"
+                    : method === "gemini-web"
+                      ? "导入 Gemini 网页账号"
                     : method === "oauth"
                       ? "OAuth 登录已有账号"
                       : "导入账号 JSON"}
@@ -805,6 +899,8 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                     ? "粘贴完整 Session JSON，系统会自动提取 accessToken。"
                     : method === "codex-auth"
                       ? "粘贴 Codex 认证 JSON，系统会按 codex 来源导入。"
+                    : method === "gemini-web"
+                      ? "支持粘贴或上传 Cookie JSON；后端会立即验证登录态，真实 Cookie 不会返回到列表。"
                     : method === "oauth"
                       ? "用浏览器跑一遍 OpenAI 标准 OAuth，拿回 refresh_token 后系统会自动续期。"
                       : "支持读取本项目导出的单账号对象或全部账号数组，并在提交前做数量确认。"}
@@ -850,6 +946,16 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
               >
                 {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
                 导入 JSON
+              </Button>
+            ) : null}
+            {method === "gemini-web" ? (
+              <Button
+                className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+                onClick={() => void handleImportGeminiWeb()}
+                disabled={footerDisabled || !geminiCookieInput.trim()}
+              >
+                {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
+                验证并导入
               </Button>
             ) : null}
             {method === "oauth" ? (

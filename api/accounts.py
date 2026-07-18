@@ -9,7 +9,7 @@ import zipfile
 from datetime import datetime
 from typing import Any, Literal
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -23,8 +23,9 @@ from api.support import (
     sanitize_sub2api_server,
     sanitize_sub2api_servers,
 )
-from services.account_service import account_service
+from services.account_service import account_service, has_gemini_web_credentials
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
+from services.gemini_web_backend import GeminiWebError
 from services.oauth_login_service import OAuthLoginError, oauth_login_service
 from services.sub2api_service import (
     list_remote_accounts as sub2api_list_remote_accounts,
@@ -52,6 +53,15 @@ class AccountCreateRequest(BaseModel):
 
 class AccountDeleteRequest(BaseModel):
     tokens: list[str] = Field(default_factory=list)
+    identifiers: list[str] = Field(default_factory=list)
+
+
+class GeminiWebAccountImportRequest(BaseModel):
+    cookie_json: Any
+
+
+class AccountValidateRequest(BaseModel):
+    identifiers: list[str] = Field(default_factory=list)
 
 
 class AccountRefreshRequest(BaseModel):
@@ -65,6 +75,7 @@ class AccountExportRequest(BaseModel):
 
 class AccountUpdateRequest(BaseModel):
     access_token: str = ""
+    account_id: str = ""
     type: str | None = None
     status: str | None = None
     quota: int | None = None
@@ -208,14 +219,71 @@ def create_router() -> APIRouter:
         return {"items": auth_service.list_keys(role="user")}
 
     @router.get("/api/accounts")
-    async def get_accounts(authorization: str | None = Header(default=None)):
+    async def get_accounts(
+        q: str = Query(default=""),
+        authorization: str | None = Header(default=None),
+    ):
         require_admin(authorization)
-        return {"items": account_service.list_accounts()}
+        return {"items": account_service.search_accounts(q)}
+
+    @router.post("/api/accounts/gemini-web")
+    async def import_gemini_web_account(
+        body: GeminiWebAccountImportRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        try:
+            return await run_in_threadpool(
+                account_service.import_gemini_web_account,
+                body.cookie_json,
+            )
+        except GeminiWebError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"error": str(exc), "code": exc.code.value},
+            ) from None
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from None
+
+    @router.post("/api/accounts/validate")
+    async def validate_accounts(
+        body: AccountValidateRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        identifiers = _unique_tokens(body.identifiers)
+        if not identifiers:
+            raise HTTPException(status_code=400, detail={"error": "identifiers is required"})
+        results = []
+        for identifier in identifiers:
+            try:
+                results.append(await run_in_threadpool(account_service.validate_account, identifier))
+            except KeyError:
+                raise HTTPException(status_code=404, detail={"error": "account not found"}) from None
+            except GeminiWebError as exc:
+                raise HTTPException(
+                    status_code=exc.status_code,
+                    detail={"error": str(exc), "code": exc.code.value},
+                ) from None
+        return {
+            "valid": all(result.get("valid") for result in results),
+            "results": results,
+            "items": account_service.list_accounts(),
+        }
 
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         account_payloads = [item for item in body.accounts if isinstance(item, dict)]
+        if any(
+            str(item.get("provider") or "").strip().lower() == "gemini_web"
+            or has_gemini_web_credentials(item)
+            for item in account_payloads
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "Gemini Web accounts must use the validated import endpoint"},
+            )
         payload_tokens = [_account_payload_token(item) for item in account_payloads]
         tokens = _unique_tokens([*body.tokens, *payload_tokens])
         if not tokens:
@@ -241,7 +309,7 @@ def create_router() -> APIRouter:
     @router.delete("/api/accounts")
     async def delete_accounts(body: AccountDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        tokens = [str(token or "").strip() for token in body.tokens if str(token or "").strip()]
+        tokens = _unique_tokens([*body.identifiers, *body.tokens])
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "tokens is required"})
         return account_service.delete_accounts(tokens)
@@ -333,9 +401,9 @@ def create_router() -> APIRouter:
     @router.post("/api/accounts/update")
     async def update_account(body: AccountUpdateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        access_token = str(body.access_token or "").strip()
+        access_token = str(body.account_id or body.access_token or "").strip()
         if not access_token:
-            raise HTTPException(status_code=400, detail={"error": "access_token is required"})
+            raise HTTPException(status_code=400, detail={"error": "account_id or access_token is required"})
         updates = {key: value for key, value in {"type": body.type, "status": body.status, "quota": body.quota, "proxy": body.proxy}.items() if value is not None}
         if not updates:
             raise HTTPException(status_code=400, detail={"error": "还没有检测到改动，请修改后再保存"})

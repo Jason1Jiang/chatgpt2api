@@ -123,6 +123,63 @@ class GeminiWebAccountPool(Protocol):
     ) -> None: ...
 
 
+class PersistedGeminiWebAccountPool:
+    """Adapter from the backend account-pool seam to AccountService."""
+
+    def __init__(
+        self,
+        *,
+        acquire_account: Callable[[set[str], float], dict[str, Any]],
+        release_slot: Callable[[str], None],
+        mark_invalid_account: Callable[[str], Any],
+        persist_refreshed_cookies: Callable[[str, Mapping[str, str]], Any]
+        | None = None,
+    ) -> None:
+        self._acquire_account = acquire_account
+        self._release_slot = release_slot
+        self._mark_invalid_account = mark_invalid_account
+        self._persist_refreshed_cookies = persist_refreshed_cookies
+
+    def acquire(
+        self,
+        *,
+        excluded_account_ids: set[str],
+        deadline: float,
+    ) -> GeminiWebAccount:
+        try:
+            value = self._acquire_account(excluded_account_ids, deadline)
+        except TimeoutError:
+            raise
+        except RuntimeError:
+            raise GeminiWebError(GeminiWebErrorCode.NO_AVAILABLE_ACCOUNT) from None
+
+        account_id = str(value.get("account_id") or "").strip()
+        try:
+            if str(value.get("provider") or "").strip().lower() != "gemini_web":
+                raise GeminiWebError(GeminiWebErrorCode.NO_AVAILABLE_ACCOUNT)
+            if str(value.get("status") or "").strip() != "正常":
+                raise GeminiWebError(GeminiWebErrorCode.NO_AVAILABLE_ACCOUNT)
+            return GeminiWebAccount.from_mapping(value)
+        except BaseException:
+            if account_id:
+                self._release_slot(account_id)
+            raise
+
+    def release(self, account: GeminiWebAccount) -> None:
+        self._release_slot(account.account_id)
+
+    def mark_invalid(self, account: GeminiWebAccount) -> None:
+        self._mark_invalid_account(account.account_id)
+
+    def persist_refreshed_cookies(
+        self,
+        account: GeminiWebAccount,
+        cookies: Mapping[str, str],
+    ) -> None:
+        if self._persist_refreshed_cookies is not None:
+            self._persist_refreshed_cookies(account.account_id, cookies)
+
+
 @dataclass(frozen=True)
 class TransportSession:
     account: GeminiWebAccount = field(repr=False)
@@ -550,6 +607,75 @@ class GeminiWebBackend:
         self._downloader = downloader
         self._clock = clock
         self._timeout_seconds = float(timeout_seconds)
+
+    def prepare_account(self, cookie_payload: Any) -> dict[str, Any]:
+        """Parse, validate, and normalize a Gemini Web account for persistence."""
+        cookies = self._parse_cookie_payload(cookie_payload)
+        provisional_id = f"gemini_web:pending:{uuid.uuid4().hex}"
+        provisional = {
+            "account_id": provisional_id,
+            "credentials": {"cookies": cookies},
+        }
+        validation = self.validate_account(provisional)
+        if validation.refreshed_cookies:
+            cookies = {**cookies, **dict(validation.refreshed_cookies)}
+        normalized_email = str(validation.email or "").strip().lower()
+        if normalized_email:
+            fingerprint = hashlib.sha256(normalized_email.encode("utf-8")).hexdigest()[:24]
+            account_id = f"gemini_web:{fingerprint}"
+        else:
+            account_id = f"gemini_web:{uuid.uuid4().hex}"
+        session_label = GeminiWebAccount(
+            account_id=account_id,
+            cookies=cookies,
+        ).session_label
+        return {
+            "account_id": account_id,
+            "provider": "gemini_web",
+            "type": "Gemini Web",
+            "source_type": "cookie_json",
+            "email": normalized_email or None,
+            "session_label": session_label,
+            "status": "正常",
+            "credentials": {"cookies": cookies},
+        }
+
+    @staticmethod
+    def _parse_cookie_payload(cookie_payload: Any) -> dict[str, str]:
+        payload = cookie_payload
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (TypeError, ValueError):
+                raise ValueError("Cookie JSON is invalid") from None
+
+        if isinstance(payload, Mapping) and "cookies" in payload:
+            payload = payload.get("cookies")
+
+        if isinstance(payload, Mapping):
+            cookies = {
+                str(name).strip(): str(value)
+                for name, value in payload.items()
+                if str(name).strip() and isinstance(value, str) and value
+            }
+        elif isinstance(payload, list):
+            cookies: dict[str, str] = {}
+            for item in payload:
+                if not isinstance(item, Mapping):
+                    continue
+                domain = str(item.get("domain") or "").strip().lower().lstrip(".")
+                if domain and domain != "google.com" and not domain.endswith(".google.com"):
+                    continue
+                name = str(item.get("name") or "").strip()
+                value = item.get("value")
+                if name and isinstance(value, str) and value:
+                    cookies[name] = value
+        else:
+            cookies = {}
+
+        if not cookies:
+            raise ValueError("Cookie JSON does not contain Google cookies")
+        return cookies
 
     def validate_account(self, account: Mapping[str, Any]) -> AccountValidation:
         normalized_account = GeminiWebAccount.from_mapping(account)
@@ -1357,3 +1483,35 @@ class HttpResultDownloader:
         if not mime_type.startswith("image/") or not content:
             raise GeminiTransportFailure(GeminiTransportFailureKind.PROTOCOL)
         return DownloadedImage(content=content, mime_type=mime_type)
+
+
+class _ValidationOnlyAccountPool:
+    def acquire(
+        self,
+        *,
+        excluded_account_ids: set[str],
+        deadline: float,
+    ) -> GeminiWebAccount:
+        raise GeminiWebError(GeminiWebErrorCode.NO_AVAILABLE_ACCOUNT)
+
+    def release(self, account: GeminiWebAccount) -> None:
+        return None
+
+    def mark_invalid(self, account: GeminiWebAccount) -> None:
+        return None
+
+    def persist_refreshed_cookies(
+        self,
+        account: GeminiWebAccount,
+        cookies: Mapping[str, str],
+    ) -> None:
+        return None
+
+
+def create_gemini_web_validation_backend() -> GeminiWebBackend:
+    """Build the production adapters used only by account import/validation."""
+    return GeminiWebBackend(
+        account_pool=_ValidationOnlyAccountPool(),
+        transport=HttpGeminiWebTransport(),
+        downloader=HttpResultDownloader(),
+    )

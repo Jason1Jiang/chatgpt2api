@@ -16,6 +16,8 @@ web/out/
 .venv
 .idea
 data
+gemini_web_cookie.key
+.gemini_web_cookie.key
 config.json
 edit
 

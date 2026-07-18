@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 from threading import Event
 
@@ -10,9 +11,21 @@ from fastapi.responses import FileResponse
 from api import accounts, ai, image_tasks, system
 from api.errors import install_exception_handlers
 from api.support import resolve_web_asset, start_limited_account_watcher
+from services.account_service import account_service
 from services.backup_service import backup_service
 from services.config import config
+from services.gemini_web_credentials import start_gemini_web_cookie_maintainer
 from services.image_service import start_image_cleanup_scheduler
+
+
+def _gemini_web_refresh_interval() -> float:
+    try:
+        return max(
+            60.0,
+            float(os.getenv("GEMINI_WEB_REFRESH_INTERVAL_SECONDS", "600")),
+        )
+    except ValueError:
+        return 600.0
 
 
 def create_app() -> FastAPI:
@@ -23,6 +36,11 @@ def create_app() -> FastAPI:
         stop_event = Event()
         thread = start_limited_account_watcher(stop_event)
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
+        gemini_cookie_thread = start_gemini_web_cookie_maintainer(
+            stop_event,
+            account_service.maintain_gemini_web_sessions,
+            interval_seconds=_gemini_web_refresh_interval(),
+        )
         backup_service.start()
         config.cleanup_old_images()
         try:
@@ -31,6 +49,7 @@ def create_app() -> FastAPI:
             stop_event.set()
             thread.join(timeout=1)
             cleanup_thread.join(timeout=1)
+            gemini_cookie_thread.join(timeout=1)
             backup_service.stop()
 
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)

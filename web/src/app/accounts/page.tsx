@@ -52,6 +52,7 @@ import {
   refreshAccounts,
   testProxy,
   updateAccount,
+  validateAccounts,
   type Account,
   type AccountRefreshResponse,
   type AccountStatus,
@@ -101,7 +102,8 @@ function formatCompact(value: number) {
 }
 
 function formatQuota(account: Account) {
-  return String(Math.max(0, account.quota));
+  if (isGeminiWeb(account)) return "—";
+  return String(Math.max(0, account.quota ?? 0));
 }
 
 function formatRestoreAt(value?: string | null) {
@@ -129,8 +131,16 @@ function formatRestoreAt(value?: string | null) {
 }
 
 function formatQuotaSummary(accounts: Account[]) {
-  const availableAccounts = accounts.filter((account) => account.status === "正常");
-  return formatCompact(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
+  const availableAccounts = accounts.filter((account) => account.status === "正常" && !isGeminiWeb(account));
+  return formatCompact(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota ?? 0), 0));
+}
+
+function isGeminiWeb(account: Account) {
+  return account.provider === "gemini_web";
+}
+
+function accountIdentifier(account: Account) {
+  return account.account_id || account.access_token || "";
 }
 
 function maskToken(token?: string) {
@@ -139,8 +149,17 @@ function maskToken(token?: string) {
   return `${token.slice(0, 16)}...${token.slice(-8)}`;
 }
 
+function displayToken(account: Account) {
+  if (!isGeminiWeb(account)) return maskToken(account.access_token);
+  const fingerprint = String(account.session_label || "").split(":").pop();
+  return fingerprint ? `Gemini Session · ${fingerprint}` : "Gemini Session";
+}
+
 function downloadTokens(accounts: Account[]) {
-  const content = `${accounts.map((account) => account.access_token).join("\n")}\n`;
+  const content = `${accounts
+    .filter((account) => !isGeminiWeb(account) && account.access_token)
+    .map((account) => account.access_token)
+    .join("\n")}\n`;
   const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -209,7 +228,7 @@ function AccountsPageContent() {
     try {
       const data = await fetchAccounts();
       setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => accountIdentifier(item) === id)));
     } catch (error) {
       const message = error instanceof Error ? error.message : "加载账户失败";
       toast.error(message);
@@ -250,8 +269,19 @@ function AccountsPageContent() {
   const filteredAccounts = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
     return accounts.filter((account) => {
+      const searchText = [
+        account.email,
+        account.session_label,
+        account.account_id,
+        account.access_token,
+        displayAccountType(account),
+        displayAccountSource(account),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
       const searchMatched =
-        normalizedQuery.length === 0 || (account.email ?? "").toLowerCase().includes(normalizedQuery);
+        normalizedQuery.length === 0 || searchText.includes(normalizedQuery);
       const typeMatched = typeFilter === "all" || displayAccountType(account) === typeFilter;
       const statusMatched = statusFilter === "all" || account.status === statusFilter;
       return searchMatched && typeMatched && statusMatched;
@@ -263,7 +293,7 @@ function AccountsPageContent() {
   const startIndex = (safePage - 1) * Number(pageSize);
   const currentRows = filteredAccounts.slice(startIndex, startIndex + Number(pageSize));
   const allCurrentSelected =
-    currentRows.length > 0 && currentRows.every((row) => selectedIds.includes(row.access_token));
+    currentRows.length > 0 && currentRows.every((row) => selectedIds.includes(accountIdentifier(row)));
 
   const summary = useMemo(() => {
     const total = accounts.length;
@@ -284,13 +314,13 @@ function AccountsPageContent() {
     [accounts],
   );
 
-  const selectedTokens = useMemo(() => {
+  const selectedIdentifiers = useMemo(() => {
     const selectedSet = new Set(selectedIds);
-    return accounts.filter((item) => selectedSet.has(item.access_token)).map((item) => item.access_token);
+    return accounts.filter((item) => selectedSet.has(accountIdentifier(item))).map(accountIdentifier).filter(Boolean);
   }, [accounts, selectedIds]);
 
-  const abnormalTokens = useMemo(() => {
-    return accounts.filter((item) => item.status === "异常").map((item) => item.access_token);
+  const abnormalIdentifiers = useMemo(() => {
+    return accounts.filter((item) => item.status === "异常").map(accountIdentifier).filter(Boolean);
   }, [accounts]);
 
   const paginationItems = useMemo(() => {
@@ -317,7 +347,7 @@ function AccountsPageContent() {
     try {
       const data = await deleteAccounts(tokens);
       setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => accountIdentifier(item) === id)));
       toast.success(`删除 ${data.removed ?? 0} 个账户`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "删除账户失败";
@@ -341,7 +371,7 @@ function AccountsPageContent() {
         await pollRefreshProgress(progress_id, (progress) => {
           if (progress.done && progress.result) {
             setAccounts(progress.result.items);
-            setSelectedIds((prev) => prev.filter((id) => progress.result!.items.some((item) => item.access_token === id)));
+            setSelectedIds((prev) => prev.filter((id) => progress.result!.items.some((item) => accountIdentifier(item) === id)));
           }
         });
       } catch (error) {
@@ -361,13 +391,13 @@ function AccountsPageContent() {
 
     // 计算非选中账号的基数（统计卡片联动用）
     const selectedTokenSet = new Set(accessTokens);
-    const baseAccountsList = accounts.filter((a) => !selectedTokenSet.has(a.access_token));
+    const baseAccountsList = accounts.filter((a) => !a.access_token || !selectedTokenSet.has(a.access_token));
     const baseActive = baseAccountsList.filter((a) => a.status === "正常").length;
     const baseLimited = baseAccountsList.filter((a) => a.status === "限流").length;
     const baseAbnormal = baseAccountsList.filter((a) => a.status === "异常").length;
     const baseDisabled = baseAccountsList.filter((a) => a.status === "禁用").length;
     const baseNormalAccounts = baseAccountsList.filter((a) => a.status === "正常");
-    const baseQuotaNum = baseNormalAccounts.reduce((s, a) => s + Math.max(0, a.quota), 0);
+    const baseQuotaNum = baseNormalAccounts.reduce((s, a) => s + Math.max(0, a.quota ?? 0), 0);
 
     // 显示进度条（只显示当前任务，不含分类统计）
     const total = accessTokens.length;
@@ -435,7 +465,7 @@ function AccountsPageContent() {
 
       // 刷新完成，更新数据
       setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => accountIdentifier(item) === id)));
 
       const relogined = data.relogined ?? 0;
 
@@ -524,6 +554,47 @@ function AccountsPageContent() {
     });
   };
 
+  const handleRefreshOrValidate = async (identifiers: string[]) => {
+    const selectedSet = new Set(identifiers);
+    const geminiIds = accounts
+      .filter((account) => isGeminiWeb(account) && selectedSet.has(accountIdentifier(account)))
+      .map(accountIdentifier)
+      .filter(Boolean);
+    const chatgptTokens = accounts
+      .filter((account) => !isGeminiWeb(account) && selectedSet.has(accountIdentifier(account)))
+      .map((account) => account.access_token)
+      .filter((token): token is string => Boolean(token));
+
+    if (geminiIds.length > 0) {
+      setRefreshingTokens((prev) => new Set([...prev, ...geminiIds]));
+      try {
+        const result = await validateAccounts(geminiIds);
+        setAccounts(result.items);
+        toast.success(`已验证 ${geminiIds.length} 个 Gemini Web 账号`);
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "Gemini Web 登录态验证失败");
+      } finally {
+        try {
+          const freshData = await fetchAccounts();
+          setAccounts(freshData.items);
+          setSelectedIds((prev) =>
+            prev.filter((id) => freshData.items.some((item) => accountIdentifier(item) === id)),
+          );
+        } catch {
+          // 验证错误已经提示；保持当前列表，避免次级刷新错误覆盖主错误。
+        }
+        setRefreshingTokens((prev) => {
+          const next = new Set(prev);
+          geminiIds.forEach((id) => next.delete(id));
+          return next;
+        });
+      }
+    }
+    if (chatgptTokens.length > 0) {
+      await handleRefreshAccounts(chatgptTokens);
+    }
+  };
+
   const handleReLogin = async (accessTokens: string[]) => {
     if (accessTokens.length === 0) {
       toast.error("请先选择要恢复的账户");
@@ -531,9 +602,11 @@ function AccountsPageContent() {
     }
 
     // 只处理异常账号，过滤非异常账号
-    const abnormalTokens = accessTokens.filter((token) => {
-      const account = accounts.find((a) => a.access_token === token);
-      return account?.status === "异常";
+    const abnormalTokens = accessTokens.flatMap((identifier) => {
+      const account = accounts.find((item) => accountIdentifier(item) === identifier);
+      return account?.status === "异常" && !isGeminiWeb(account) && account.access_token
+        ? [account.access_token]
+        : [];
     });
 
     if (abnormalTokens.length === 0) {
@@ -549,7 +622,7 @@ function AccountsPageContent() {
 
     // 计算非选中账号的基数（统计卡片联动用）
     const selectedTokenSet = new Set(abnormalTokens);
-    const baseAccountsList = accounts.filter((a) => !selectedTokenSet.has(a.access_token));
+    const baseAccountsList = accounts.filter((a) => !a.access_token || !selectedTokenSet.has(a.access_token));
     const baseActive = baseAccountsList.filter((a) => a.status === "正常").length;
     const baseLimited = baseAccountsList.filter((a) => a.status === "限流").length;
     const baseAbnormal = baseAccountsList.filter((a) => a.status === "异常").length;
@@ -626,7 +699,7 @@ function AccountsPageContent() {
       try {
         const freshData = await fetchAccounts();
         setAccounts(freshData.items);
-        setSelectedIds((prev) => prev.filter((id) => freshData.items.some((item) => item.access_token === id)));
+        setSelectedIds((prev) => prev.filter((id) => freshData.items.some((item) => accountIdentifier(item) === id)));
       } catch { /* 静默失败 */ }
 
       setProgress({
@@ -681,12 +754,12 @@ function AccountsPageContent() {
 
     setIsUpdating(true);
     try {
-      const data = await updateAccount(editingAccount.access_token, {
+      const data = await updateAccount(accountIdentifier(editingAccount), {
         status: editStatus,
         proxy: editProxy.trim(),
       });
       setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => accountIdentifier(item) === id)));
       setEditingAccount(null);
       toast.success("账号信息已更新");
     } catch (error) {
@@ -699,10 +772,10 @@ function AccountsPageContent() {
 
   const toggleSelectAll = (checked: boolean) => {
     if (checked) {
-      setSelectedIds((prev) => Array.from(new Set([...prev, ...currentRows.map((item) => item.access_token)])));
+      setSelectedIds((prev) => Array.from(new Set([...prev, ...currentRows.map(accountIdentifier).filter(Boolean)])));
       return;
     }
-    setSelectedIds((prev) => prev.filter((id) => !currentRows.some((row) => row.access_token === id)));
+    setSelectedIds((prev) => prev.filter((id) => !currentRows.some((row) => accountIdentifier(row) === id)));
   };
 
   return (
@@ -728,8 +801,12 @@ function AccountsPageContent() {
           <Button
             variant="outline"
             className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
-            onClick={() => void handleRefreshAccounts(accounts.map((item) => item.access_token))}
-            disabled={isLoading || isRefreshing || isDeleting || accounts.length === 0}
+            onClick={() =>
+              void handleRefreshAccounts(
+                accounts.flatMap((item) => (!isGeminiWeb(item) && item.access_token ? [item.access_token] : [])),
+              )
+            }
+            disabled={isLoading || isRefreshing || isDeleting || !accounts.some((item) => !isGeminiWeb(item))}
           >
             <RefreshCw className={cn("size-4", isRefreshing ? "animate-spin" : "")} />
             一键刷新所有账号信息和额度
@@ -746,7 +823,7 @@ function AccountsPageContent() {
             variant="outline"
             className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
             onClick={() => downloadTokens(accounts)}
-            disabled={accounts.length === 0}
+            disabled={!accounts.some((account) => !isGeminiWeb(account) && account.access_token)}
           >
             <Download className="size-4" />
             导出全部 Token
@@ -923,7 +1000,7 @@ function AccountsPageContent() {
                   setQuery(event.target.value);
                   setPage(1);
                 }}
-                placeholder="搜索邮箱"
+                placeholder="搜索邮箱或会话标识"
                 className="h-10 rounded-xl border-stone-200 bg-white/85 pl-10"
               />
             </div>
@@ -992,17 +1069,17 @@ function AccountsPageContent() {
                 <Button
                   variant="ghost"
                   className="h-8 rounded-lg px-3 text-stone-500 hover:bg-stone-100"
-                  onClick={() => void handleRefreshAccounts(selectedTokens)}
-                  disabled={selectedTokens.length === 0 || isRefreshing}
+                  onClick={() => void handleRefreshOrValidate(selectedIdentifiers)}
+                  disabled={selectedIdentifiers.length === 0 || isRefreshing}
                 >
                   {isRefreshing ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
-                  刷新选中账号信息和额度
+                  刷新或验证选中账号
                 </Button>
                 <Button
                   variant="ghost"
                   className="h-8 rounded-lg px-3 text-amber-600 hover:bg-amber-50 hover:text-amber-700"
-                  onClick={() => void handleReLogin(selectedTokens)}
-                  disabled={selectedTokens.length === 0 || isRelogining}
+                  onClick={() => void handleReLogin(selectedIdentifiers)}
+                  disabled={selectedIdentifiers.length === 0 || isRelogining}
                   title="尝试密码登录恢复账号"
                 >
                   {isRelogining ? <LoaderCircle className="size-4 animate-spin" /> : <LogIn className="size-4" />}
@@ -1011,8 +1088,8 @@ function AccountsPageContent() {
                 <Button
                   variant="ghost"
                   className="h-8 rounded-lg px-3 text-rose-500 hover:bg-rose-50 hover:text-rose-600"
-                  onClick={() => void handleDeleteTokens(abnormalTokens)}
-                  disabled={abnormalTokens.length === 0 || isDeleting}
+                  onClick={() => void handleDeleteTokens(abnormalIdentifiers)}
+                  disabled={abnormalIdentifiers.length === 0 || isDeleting}
                 >
                   {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
                   移除异常账号
@@ -1020,8 +1097,8 @@ function AccountsPageContent() {
                 <Button
                   variant="ghost"
                   className="h-8 rounded-lg px-3 text-rose-500 hover:bg-rose-50 hover:text-rose-600"
-                  onClick={() => void handleDeleteTokens(selectedTokens)}
-                  disabled={selectedTokens.length === 0 || isDeleting}
+                  onClick={() => void handleDeleteTokens(selectedIdentifiers)}
+                  disabled={selectedIdentifiers.length === 0 || isDeleting}
                 >
                   {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
                   删除所选
@@ -1062,20 +1139,21 @@ function AccountsPageContent() {
                   {currentRows.map((account) => {
                     const status = statusMeta[account.status];
                     const StatusIcon = status.icon;
+                    const identifier = accountIdentifier(account);
 
                     return (
                       <tr
-                        key={account.access_token}
+                        key={identifier}
                         className="border-b border-stone-100/80 text-sm text-stone-600 transition-colors hover:bg-stone-50/70"
                       >
                         <td className="px-4 py-3">
                           <Checkbox
-                            checked={selectedIds.includes(account.access_token)}
+                            checked={selectedIds.includes(identifier)}
                             onCheckedChange={(checked) => {
                               setSelectedIds((prev) =>
                                 checked
-                                  ? Array.from(new Set([...prev, account.access_token]))
-                                  : prev.filter((item) => item !== account.access_token),
+                                  ? Array.from(new Set([...prev, identifier]))
+                                  : prev.filter((item) => item !== identifier),
                               );
                             }}
                           />
@@ -1083,18 +1161,20 @@ function AccountsPageContent() {
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-2">
                             <span className="font-medium tracking-tight text-stone-700">
-                              {maskToken(account.access_token)}
+                              {displayToken(account)}
                             </span>
-                            <button
-                              type="button"
-                              className="rounded-lg p-1 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
-                              onClick={() => {
-                                void navigator.clipboard.writeText(account.access_token);
-                                toast.success("token 已复制");
-                              }}
-                            >
-                              <Copy className="size-4" />
-                            </button>
+                            {!isGeminiWeb(account) && account.access_token ? (
+                              <button
+                                type="button"
+                                className="rounded-lg p-1 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
+                                onClick={() => {
+                                  void navigator.clipboard.writeText(account.access_token!);
+                                  toast.success("token 已复制");
+                                }}
+                              >
+                                <Copy className="size-4" />
+                              </button>
+                            ) : null}
                           </div>
                         </td>
                         <td className="px-4 py-3">
@@ -1117,7 +1197,9 @@ function AccountsPageContent() {
                           </Badge>
                         </td>
                         <td className="px-4 py-3">
-                          <div className="text-xs leading-5 text-stone-500">{account.email ?? "—"}</div>
+                          <div className="text-xs leading-5 text-stone-500">
+                            {account.email ?? account.session_label ?? "—"}
+                          </div>
                         </td>
                         <td className="px-4 py-3 text-xs leading-5 text-stone-500">
                           {(() => {
@@ -1137,6 +1219,7 @@ function AccountsPageContent() {
                         </td>
                         <td className="px-4 py-3 text-xs leading-5 text-stone-500">
                           {(() => {
+                            if (isGeminiWeb(account)) return <div>—</div>;
                             const restore = formatRestoreAt(account.restore_at);
                             return (
                               <div className="space-y-0.5">
@@ -1182,15 +1265,15 @@ function AccountsPageContent() {
                             <button
                               type="button"
                               className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
-                              onClick={() => void handleRefreshAccounts([account.access_token])}
-                              disabled={isRefreshing || refreshingTokens.has(account.access_token)}
+                              onClick={() => void handleRefreshOrValidate([identifier])}
+                              disabled={isRefreshing || refreshingTokens.has(identifier)}
                             >
-                              <RefreshCw className={cn("size-4", (isRefreshing || refreshingTokens.has(account.access_token)) ? "animate-spin" : "")} />
+                              <RefreshCw className={cn("size-4", (isRefreshing || refreshingTokens.has(identifier)) ? "animate-spin" : "")} />
                             </button>
                             <button
                               type="button"
                               className="rounded-lg p-2 transition hover:bg-rose-50 hover:text-rose-500"
-                              onClick={() => void handleDeleteTokens([account.access_token])}
+                              onClick={() => void handleDeleteTokens([identifier])}
                               disabled={isDeleting}
                             >
                               <Trash2 className="size-4" />

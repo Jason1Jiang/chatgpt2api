@@ -9,10 +9,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Condition, Lock, Thread
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import urlencode
 
 from services.config import config
+from services.gemini_web_backend import (
+    GeminiWebBackend,
+    GeminiWebError,
+    GeminiWebErrorCode,
+    create_gemini_web_validation_backend,
+)
+from services.gemini_web_credentials import (
+    GeminiWebCookieVault,
+    default_gemini_web_cookie_vault,
+)
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
     log_service,
@@ -21,8 +31,45 @@ from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
 
 
+def is_gemini_web_account(account: dict[str, Any]) -> bool:
+    return str(account.get("provider") or "").strip().lower() == "gemini_web"
+
+
+def has_gemini_web_credentials(account: dict[str, Any]) -> bool:
+    credentials = account.get("credentials")
+    wrapped_cookies = credentials.get("cookies") if isinstance(credentials, dict) else None
+    protected_cookies = (
+        credentials.get("protected_cookies") if isinstance(credentials, dict) else None
+    )
+    return bool(wrapped_cookies or protected_cookies or account.get("cookies"))
+
+
+def account_identifier(account: dict[str, Any]) -> str:
+    return str(account.get("account_id") or account.get("access_token") or "").strip()
+
+
+def public_account(account: dict[str, Any]) -> dict[str, Any]:
+    item = {
+        key: value
+        for key, value in account.items()
+        if key not in {"credentials", "cookies"}
+    }
+    if is_gemini_web_account(account):
+        for key in (
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "password",
+            "quota",
+            "restore_at",
+            "limits_progress",
+        ):
+            item.pop(key, None)
+    return item
+
+
 class AccountService:
-    """账号池服务，使用 token -> account 的 dict 保存账号。"""
+    """账号池服务，使用稳定内部标识 -> account 的 dict 保存账号。"""
 
     _IMAGE_ACCOUNT_CHECK_RETRIES = 3
     _IMAGE_ACCOUNT_CHECK_RETRY_BACKOFF_SECONDS = 0.5
@@ -48,15 +95,27 @@ class AccountService:
     _relogin_progress: dict[str, dict] = {}
     _relogin_progress_lock = Lock()
 
-    def __init__(self, storage_backend: StorageBackend):
+    def __init__(
+        self,
+        storage_backend: StorageBackend,
+        *,
+        gemini_web_backend: GeminiWebBackend | None = None,
+        gemini_web_cookie_vault: GeminiWebCookieVault | None = None,
+    ):
         self.storage = storage_backend
+        self._gemini_web_cookie_vault = (
+            gemini_web_cookie_vault or default_gemini_web_cookie_vault()
+        )
         self._lock = Lock()
         self._token_refresh_lock = Lock()
         self._image_slot_condition = Condition(self._lock)
         self._index = 0
+        self._gemini_web_index = 0
+        self._gemini_web_refreshing: set[str] = set()
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
         self._token_aliases: dict[str, str] = {}
+        self._gemini_web_backend = gemini_web_backend or create_gemini_web_validation_backend()
         self._cumulative_total = self._load_cumulative_total()
 
     def _get_cumulative_file(self) -> Path:
@@ -120,15 +179,66 @@ class AccountService:
         return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz).isoformat()
 
     def _load_accounts(self) -> dict[str, dict]:
-        accounts = self.storage.load_accounts()
+        accounts = [
+            self._decode_gemini_web_credentials(item)
+            for item in self.storage.load_accounts()
+        ]
         return {
-            normalized["access_token"]: normalized
+            self._storage_key(normalized): normalized
             for item in accounts
             if (normalized := self._normalize_account(item)) is not None
+            and self._storage_key(normalized)
         }
 
     def _save_accounts(self) -> None:
-        self.storage.save_accounts(list(self._accounts.values()))
+        self.storage.save_accounts(
+            [
+                self._encode_gemini_web_credentials(account)
+                for account in self._accounts.values()
+            ]
+        )
+
+    def _decode_gemini_web_credentials(self, item: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(item, dict):
+            return item
+        credentials = item.get("credentials")
+        protected = (
+            credentials.get("protected_cookies")
+            if isinstance(credentials, dict)
+            else None
+        )
+        if not isinstance(protected, dict):
+            return item
+        cookies = self._gemini_web_cookie_vault.open(protected)
+        decoded = dict(item)
+        decoded["credentials"] = {
+            **{
+                key: value
+                for key, value in credentials.items()
+                if key != "protected_cookies"
+            },
+            "cookies": cookies,
+        }
+        return decoded
+
+    def _encode_gemini_web_credentials(self, item: dict[str, Any]) -> dict[str, Any]:
+        if not is_gemini_web_account(item):
+            return dict(item)
+        credentials = item.get("credentials")
+        cookies = credentials.get("cookies") if isinstance(credentials, dict) else None
+        if not isinstance(cookies, dict) or not cookies:
+            raise RuntimeError("Gemini Web account has no protected credentials")
+        encoded = dict(item)
+        encoded.pop("cookies", None)
+        encoded["credentials"] = {
+            **{
+                key: value
+                for key, value in credentials.items()
+                if key not in {"cookies", "protected_cookies"}
+            },
+            "protected_cookies": self._gemini_web_cookie_vault.seal(cookies),
+        }
+        return encoded
 
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
@@ -208,6 +318,26 @@ class AccountService:
     def _normalize_account(self, item: dict) -> dict | None:
         if not isinstance(item, dict):
             return None
+        if is_gemini_web_account(item):
+            account_id = str(item.get("account_id") or "").strip()
+            credentials = item.get("credentials")
+            cookies = credentials.get("cookies") if isinstance(credentials, dict) else None
+            if not account_id or not isinstance(cookies, dict) or not cookies:
+                return None
+            return {
+                "account_id": account_id,
+                "provider": "gemini_web",
+                "type": "Gemini Web",
+                "source_type": "cookie_json",
+                "status": item.get("status") or "正常",
+                "email": item.get("email") or None,
+                "session_label": str(item.get("session_label") or "").strip(),
+                "proxy": str(item.get("proxy") or "").strip(),
+                "success": int(item.get("success") or 0),
+                "fail": int(item.get("fail") or 0),
+                "created_at": item.get("created_at") or AccountService._now(),
+                "credentials": {"cookies": dict(cookies)},
+            }
         access_token = item.get("access_token") or item.get("accessToken") or ""
         if not access_token:
             return None
@@ -243,6 +373,27 @@ class AccountService:
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
         return normalized
+
+    @staticmethod
+    def _storage_key(account: dict[str, Any]) -> str:
+        if is_gemini_web_account(account):
+            return str(account.get("account_id") or "").strip()
+        return str(account.get("access_token") or "").strip()
+
+    def _resolve_account_key_locked(self, identifier: str) -> str:
+        value = str(identifier or "").strip()
+        if not value:
+            return ""
+        resolved = self._resolve_access_token_locked(value)
+        if resolved in self._accounts:
+            return resolved
+        for key, account in self._accounts.items():
+            if value in {account_identifier(account), str(account.get("access_token") or "").strip()}:
+                return key
+        return value
+
+    def _public_accounts_locked(self) -> list[dict[str, Any]]:
+        return [public_account(item) for item in self._accounts.values()]
 
     @staticmethod
     def _jwt_exp(access_token: str) -> int:
@@ -886,7 +1037,11 @@ class AccountService:
 
     def list_tokens(self) -> list[str]:
         with self._lock:
-            return list(self._accounts)
+            return [
+                token
+                for account in self._accounts.values()
+                if (token := str(account.get("access_token") or "").strip())
+            ]
 
     def _list_ready_candidate_tokens(
             self,
@@ -954,6 +1109,119 @@ class AccountService:
             else:
                 self._image_inflight[access_token] = current_inflight - 1
             self._image_slot_condition.notify_all()
+
+    def acquire_gemini_web_account(
+        self,
+        excluded_account_ids: set[str] | None = None,
+        deadline: float = 0,
+    ) -> dict[str, Any]:
+        """Acquire one normal Gemini Web account without consulting quota state."""
+        excluded = set(excluded_account_ids or set())
+        max_concurrency = max(1, int(config.image_account_concurrency or 1))
+        with self._image_slot_condition:
+            while True:
+                candidates = [
+                    account
+                    for account in self._accounts.values()
+                    if is_gemini_web_account(account)
+                    and str(account.get("status") or "").strip() == "正常"
+                    and (account_id := account_identifier(account))
+                    and account_id not in excluded
+                    and account_id not in self._gemini_web_refreshing
+                ]
+                if not candidates:
+                    raise RuntimeError("no available Gemini Web account")
+                available = [
+                    account
+                    for account in candidates
+                    if int(self._image_inflight.get(account_identifier(account), 0))
+                    < max_concurrency
+                ]
+                if available:
+                    account = available[self._gemini_web_index % len(available)]
+                    self._gemini_web_index += 1
+                    account_id = account_identifier(account)
+                    self._image_inflight[account_id] = int(
+                        self._image_inflight.get(account_id, 0)
+                    ) + 1
+                    return dict(account)
+                remaining = float(deadline) - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Gemini Web account slot wait timed out")
+                self._image_slot_condition.wait(timeout=min(1.0, remaining))
+
+    def mark_gemini_web_account_invalid(self, account_id: str) -> dict | None:
+        account = self.get_account(account_id)
+        if account is None or not is_gemini_web_account(account):
+            return None
+        return self.update_account(account_id, {"status": "异常"}, quiet=True)
+
+    def persist_gemini_web_cookies(
+        self,
+        account_id: str,
+        cookies: Any,
+    ) -> dict[str, Any] | None:
+        updates = {
+            str(name): value
+            for name, value in (
+                cookies.items() if isinstance(cookies, Mapping) else ()
+            )
+            if str(name).strip() and isinstance(value, str) and value
+        }
+        if not updates:
+            return None
+        with self._lock:
+            key = self._resolve_account_key_locked(account_id)
+            current = self._accounts.get(key)
+            if current is None or not is_gemini_web_account(current):
+                return None
+            credentials = current.get("credentials")
+            existing = (
+                dict(credentials.get("cookies") or {})
+                if isinstance(credentials, dict)
+                else {}
+            )
+            merged = {**existing, **updates}
+            if merged == existing:
+                return public_account(current)
+            next_item = dict(current)
+            next_item["credentials"] = {"cookies": merged}
+            self._accounts[key] = next_item
+            self._save_accounts()
+            return public_account(next_item)
+
+    def maintain_gemini_web_sessions(self) -> dict[str, int]:
+        with self._image_slot_condition:
+            candidates: list[str] = []
+            skipped = 0
+            for current in self._accounts.values():
+                if not is_gemini_web_account(current):
+                    continue
+                account_id = account_identifier(current)
+                if (
+                    not account_id
+                    or str(current.get("status") or "").strip() != "正常"
+                    or int(self._image_inflight.get(account_id, 0)) > 0
+                    or account_id in self._gemini_web_refreshing
+                ):
+                    skipped += 1
+                    continue
+                self._gemini_web_refreshing.add(account_id)
+                candidates.append(account_id)
+
+        refreshed = 0
+        failed = 0
+        for account_id in candidates:
+            try:
+                self.validate_account(account_id)
+                refreshed += 1
+            except Exception:
+                failed += 1
+            finally:
+                with self._image_slot_condition:
+                    self._gemini_web_refreshing.discard(account_id)
+                    self._image_slot_condition.notify_all()
+        return {"refreshed": refreshed, "failed": failed, "skipped": skipped}
 
     @staticmethod
     def _is_transient_image_account_check_error(exc: Exception) -> bool:
@@ -1120,13 +1388,15 @@ class AccountService:
             self.update_account(access_token, {"status": "异常", "quota": 0}, quiet=quiet)
         return removed
 
-    def get_account(self, access_token: str) -> dict | None:
-        if not access_token:
+    def get_account(self, identifier: str, *, public: bool = False) -> dict | None:
+        if not identifier:
             return None
         with self._lock:
-            access_token = self._resolve_access_token_locked(access_token)
-            account = self._accounts.get(access_token)
-            return dict(account) if account else None
+            key = self._resolve_account_key_locked(identifier)
+            account = self._accounts.get(key)
+            if not account:
+                return None
+            return public_account(account) if public else dict(account)
 
     def list_accounts(self) -> list[dict]:
         """返回所有账号的副本，并为每个账号附加当前图片在途数 image_inflight。
@@ -1137,8 +1407,8 @@ class AccountService:
         with self._lock:
             result = []
             for item in self._accounts.values():
-                account = dict(item)
-                token = account.get("access_token") or ""
+                account = public_account(item)
+                token = account_identifier(item)
                 account["image_inflight"] = int(self._image_inflight.get(token, 0))
                 result.append(account)
             return result
@@ -1169,6 +1439,8 @@ class AccountService:
     def _prepare_account_payload(item: dict) -> dict | None:
         if not isinstance(item, dict):
             return None
+        if is_gemini_web_account(item) or has_gemini_web_credentials(item):
+            return None
         access_token = AccountService._account_payload_token(item)
         if not access_token:
             return None
@@ -1194,6 +1466,58 @@ class AccountService:
         ]
         return self._add_account_payloads(payloads)
 
+    def import_gemini_web_account(self, cookie_payload: Any) -> dict[str, Any]:
+        account = self._gemini_web_backend.prepare_account(cookie_payload)
+        result = self._add_account_payloads([account], allow_gemini_web=True)
+        item = self.get_account(account["account_id"], public=True)
+        return {**result, "item": item}
+
+    def search_accounts(self, query: str) -> list[dict[str, Any]]:
+        normalized_query = str(query or "").strip().lower()
+        accounts = self.list_accounts()
+        if not normalized_query:
+            return accounts
+        return [
+            account
+            for account in accounts
+            if normalized_query in " ".join(
+                str(account.get(key) or "").lower()
+                for key in ("email", "session_label", "account_id", "access_token", "type", "source_type")
+            )
+        ]
+
+    def validate_account(self, identifier: str) -> dict[str, Any]:
+        account = self.get_account(identifier)
+        if account is None:
+            raise KeyError("account not found")
+        if not is_gemini_web_account(account):
+            item = self.fetch_remote_info(
+                str(account.get("access_token") or identifier),
+                event="manual_validate",
+            )
+            return {"valid": item is not None, "item": public_account(item or account)}
+        try:
+            validation = self._gemini_web_backend.validate_account(account)
+        except GeminiWebError as error:
+            if error.code == GeminiWebErrorCode.NO_AVAILABLE_ACCOUNT:
+                self.update_account(identifier, {"status": "异常"}, quiet=True)
+            raise
+        if validation.refreshed_cookies:
+            self.persist_gemini_web_cookies(
+                identifier,
+                dict(validation.refreshed_cookies),
+            )
+        item = self.update_account(
+            identifier,
+            {
+                "status": "正常",
+                "email": validation.email or account.get("email"),
+                "session_label": validation.session_label,
+            },
+            quiet=True,
+        )
+        return {"valid": True, "item": item}
+
     def add_accounts(self, tokens: list[str], source_type: str = "web") -> dict:
         tokens = list(dict.fromkeys(token for token in tokens if token))
         if not tokens:
@@ -1203,16 +1527,26 @@ class AccountService:
             for token in tokens
         ])
 
-    def _add_account_payloads(self, payloads: list[dict]) -> dict:
+    def _add_account_payloads(
+        self,
+        payloads: list[dict],
+        *,
+        allow_gemini_web: bool = False,
+    ) -> dict:
         deduped: dict[str, dict] = {}
         for payload in payloads:
             if not isinstance(payload, dict):
                 continue
-            access_token = self._account_payload_token(payload)
-            if not access_token:
+            if (
+                is_gemini_web_account(payload)
+                or has_gemini_web_credentials(payload)
+            ) and not allow_gemini_web:
                 continue
-            current = deduped.get(access_token, {})
-            deduped[access_token] = {**current, **payload, "access_token": access_token}
+            key = self._storage_key(payload)
+            if not key:
+                continue
+            current = deduped.get(key, {})
+            deduped[key] = {**current, **payload}
 
         if not deduped:
             return {"added": 0, "skipped": 0, "items": self.list_accounts()}
@@ -1220,8 +1554,8 @@ class AccountService:
         with self._lock:
             added = 0
             skipped = 0
-            for access_token, payload in deduped.items():
-                current = self._accounts.get(access_token)
+            for key, payload in deduped.items():
+                current = self._accounts.get(key)
                 if current is None:
                     added += 1
                     self._cumulative_total += 1
@@ -1236,14 +1570,13 @@ class AccountService:
                     {
                         **current,
                         **incoming,
-                        "access_token": access_token,
                         "type": str(incoming.get("type") or current.get("type") or "free"),
                     }
                 )
                 if account is not None:
-                    self._accounts[access_token] = account
+                    self._accounts[key] = account
             self._save_accounts()
-            items = [dict(item) for item in self._accounts.values()]
+            items = self._public_accounts_locked()
             log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
                             {"added": added, "skipped": skipped})
         return {"added": added, "skipped": skipped, "items": items}
@@ -1253,7 +1586,7 @@ class AccountService:
         if not target_set:
             return {"removed": 0, "items": self.list_accounts()}
         with self._lock:
-            target_set = {self._resolve_access_token_locked(token) for token in target_set if token}
+            target_set = {self._resolve_account_key_locked(token) for token in target_set if token}
             removed = sum(self._accounts.pop(token, None) is not None for token in target_set)
             for token in target_set:
                 self._image_inflight.pop(token, None)
@@ -1269,14 +1602,14 @@ class AccountService:
                     self._index = 0
                 self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
-            items = [dict(item) for item in self._accounts.values()]
+            items = self._public_accounts_locked()
         return {"removed": removed, "items": items}
 
     def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
         if not access_token:
             return None
         with self._lock:
-            access_token = self._resolve_access_token_locked(access_token)
+            access_token = self._resolve_account_key_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
                 return None
@@ -1293,7 +1626,7 @@ class AccountService:
             if not quiet:
                 log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
                                 {"token": anonymize_token(access_token), "status": account.get("status")})
-            return dict(account)
+            return public_account(account)
         return None
 
     def _record_refresh_success(self, access_token: str) -> None:
@@ -1693,7 +2026,12 @@ class AccountService:
             accounts = [
                 dict(item)
                 for item in self._accounts.values()
-                if not target_tokens or str(item.get("access_token") or "") in target_tokens
+                if not is_gemini_web_account(item)
+                and (
+                    not target_tokens
+                    or str(item.get("access_token") or "") in target_tokens
+                    or account_identifier(item) in target_tokens
+                )
             ]
 
         items: list[dict[str, str]] = []
@@ -1745,7 +2083,11 @@ class AccountService:
         limited = sum(1 for a in items if a.get("status") == "限流")
         abnormal = sum(1 for a in items if a.get("status") == "异常")
         disabled = sum(1 for a in items if a.get("status") == "禁用")
-        total_quota = sum(max(0, int(a.get("quota") or 0)) for a in items if a.get("status") == "正常")
+        total_quota = sum(
+            max(0, int(a.get("quota") or 0))
+            for a in items
+            if a.get("status") == "正常" and not is_gemini_web_account(a)
+        )
         total_success = sum(int(a.get("success") or 0) for a in items)
         total_fail = sum(int(a.get("fail") or 0) for a in items)
         by_type = {}

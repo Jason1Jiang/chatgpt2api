@@ -17,11 +17,14 @@ export type ImageStorageSettings = {
 };
 
 export type Account = {
-  access_token: string;
+  access_token?: string;
+  account_id?: string;
+  provider?: string;
+  session_label?: string;
   type: AccountType;
   source_type?: string | null;
   status: AccountStatus;
-  quota: number;
+  quota?: number;
   email?: string | null;
   user_id?: string | null;
   limits_progress?: Array<{
@@ -343,6 +346,13 @@ export async function createAccounts(tokens: string[], accounts: AccountImportPa
   });
 }
 
+export async function importGeminiWebAccount(cookieJson: unknown) {
+  return httpRequest<AccountMutationResponse & { item: Account }>("/api/accounts/gemini-web", {
+    method: "POST",
+    body: { cookie_json: cookieJson },
+  });
+}
+
 export type OAuthLoginStartResponse = {
   session_id: string;
   authorize_url: string;
@@ -364,11 +374,18 @@ export async function finishOAuthLogin(sessionId: string, callback: string) {
   });
 }
 
-export async function deleteAccounts(tokens: string[]) {
+export async function deleteAccounts(identifiers: string[]) {
   return httpRequest<AccountMutationResponse>("/api/accounts", {
     method: "DELETE",
-    body: { tokens },
+    body: { identifiers },
   });
+}
+
+export async function validateAccounts(identifiers: string[]) {
+  return httpRequest<{ valid: boolean; results: Array<{ valid: boolean; item: Account }>; items: Account[] }>(
+    "/api/accounts/validate",
+    { method: "POST", body: { identifiers } },
+  );
 }
 
 export async function refreshAccounts(accessTokens: string[]) {
@@ -394,7 +411,7 @@ export async function fetchReLoginProgress(progressId: string) {
 }
 
 export async function updateAccount(
-  accessToken: string,
+  identifier: string,
   updates: {
     type?: AccountType;
     status?: AccountStatus;
@@ -405,7 +422,7 @@ export async function updateAccount(
   return httpRequest<AccountUpdateResponse>("/api/accounts/update", {
     method: "POST",
     body: {
-      access_token: accessToken,
+      account_id: identifier,
       ...updates,
     },
   });
