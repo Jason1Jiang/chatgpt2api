@@ -534,6 +534,6 @@ InfiniteCanvas 会把多张生成拆成多个独立 `n=1` 请求。ChatGPT2API �
 - 未读取浏览器 profile，未增加浏览器登录导入。
 - 未向 upstream 执行任何写操作。
 
-## 15. 下一步
+## 15. 后续门槛
 
-工单 `#10` 的只读现场复核已经完成并关闭。当前 frontier 是 `#11`：建立只含 README 入口、Gemini Web MVP 规格和本计划的可审计规划提交。`#11` 验收关闭后，才可启动 `#12`，此后继续按 `blocked_by` 关系和“一票一个 subagent”规则串行推进。
+工单 `#10`–`#16` 已形成现场复核、规划基线和五个独立功能提交；工单 `#17` 负责把它们组装为干净、可审计的 integration 历史。integration 验收不等于更新 `main`、部署或发布：本地 `main` 快进只属于 `#18`，当前环境与 InfiniteCanvas 的真实验收只属于 `#19`，owner `origin` 发布只属于 `#20`。

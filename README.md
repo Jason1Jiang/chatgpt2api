@@ -141,6 +141,7 @@ environment:
 
 - 详细状态说明见：[功能清单](./docs/feature-status.en.md)
 - Gemini 网页文生图 / 图生图反代见：[MVP 开发计划](./docs/gemini-web-image-proxy-mvp.md)
+- Gemini Web Cookie 会在成功认证后加密写回，并由后台维护器定期刷新；部署与密钥要求见：[可刷新登录态](./docs/gemini-web-cookie-maintenance.md)
 
 ## 效果展示
 

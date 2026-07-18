@@ -2,9 +2,10 @@
 
 ## 文档状态
 
-- 状态：MVP 范围已确认，待后续开发。
+- 状态：MVP 实现、可审计提交和 fixture 驱动的离线验收已完成。
 - 目标上游：`gemini.google.com` 消费者网页端，不是 Google AI Studio API，也不是 Antigravity / Cloud Code 额度。
-- 实现边界：本文档只固定后续开发的产品与技术契约，不表示功能已实现。
+- 已实现范围：Gemini Web 深模块、受保护账号生命周期、OpenAI 兼容文生图与参考图编辑，以及无真实凭据的验收工作流。
+- 证据边界：当前环境部署、真实 Gemini 请求与 InfiniteCanvas 端到端证据由工单 `#19` 验收；owner `origin` 发布由工单 `#20` 验收，本文档不把这些后续步骤记为已完成。
 
 ## 0. 如何使用本文档
 
