@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "mode": "live",
+  "status": "ok",
+  "same_account_for_all_stages": true,
+  "account_validation": {
+    "valid": true,
+    "email_present": true
+  },
+  "text_generation": {
+    "downloaded_original": true,
+    "generated_image_count": 1,
+    "mime_types": [
+      "image/png"
+    ]
+  },
+  "image_edit": {
+    "reference_count": 1,
+    "downloaded_original": true,
+    "generated_image_count": 1,
+    "mime_types": [
+      "image/png"
+    ],
+    "result_distinct_from_reference": true,
+    "backend_generated_kind_filter_applied": true
+  },
+  "capture_boundary": {
+    "raw_headers_stored": false,
+    "raw_responses_stored": false,
+    "credentials_stored": false,
+    "account_identifier_stored": false
+  }
+}

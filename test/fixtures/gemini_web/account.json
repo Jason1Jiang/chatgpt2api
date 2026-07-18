@@ -1,0 +1,8 @@
+{
+  "account_id": "gemini_web:fixture-account",
+  "credentials": {
+    "cookies": {
+      "__Secure-1PSID": "FAKE_FIXTURE_COOKIE_NOT_VALID"
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "account": {
+    "email": "fixture.user@example.invalid"
+  },
+  "session": {
+    "xsrf": "FAKE_FIXTURE_XSRF",
+    "rpc_id": "FAKE_FIXTURE_RPC"
+  }
+}

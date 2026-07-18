@@ -1,0 +1,7 @@
+)]}'
+112
+{"images":[{"kind":"input_attachment","download_ref":"fixture://input/original","mime_type":"image/png"}]}
+108
+{"images":[{"kind":"web_image","download_ref":"fixture://search/result","mime_type":"image/jpeg"}]}
+168
+{"revised_prompt":"fixture revised prompt","images":[{"kind":"generated_image","download_ref":"fixture://generated/original","mime_type":"image/png"}]}
