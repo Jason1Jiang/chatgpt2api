@@ -1,13 +1,13 @@
 # Gemini Web 最小协议安全探测
 
-本工具只用于工单 #12 的协议验证。它不会读取 Chrome、Edge 或其他浏览器的 Cookie、profile、localStorage、session store，也不会扫描默认目录寻找凭据。
+本工具只用于工单 #12 的协议验证和后续人工闸门。它不会读取 Chrome、Edge 或其他浏览器的 Cookie、profile、localStorage、session store，也不会扫描默认目录寻找凭据。
 
 ## 当前协议状态
 
 `services/gemini_web_backend.py` 中的正式 HTTP Adapter 已按当前消费者网页协议收敛到以下内部链路：
 
 - 使用同一 HTTP 会话依次完成 Google 预检与 `/app` 初始化，从页面提取 `SNlM0e`、构建标签、会话 ID、语言和文件 Push-ID。
-- 当初始化只缺少 `SNlM0e` 时，可调用 Google Cookie 轮换端点在内存会话中刷新短期 Cookie；探测工具不会把刷新值写回输入文件。Backend 只通过账号池 seam 返回刷新值，持久化与加密不属于本工单。
+- 当初始化只缺少 `SNlM0e` 时，可调用 Google Cookie 轮换端点在内存会话中刷新短期 Cookie；探测工具不会把刷新值写回输入文件。正式账号服务会通过账号模块的窄接口保存成功认证后的完整会话 Cookie，并按 `gemini-web-cookie-maintenance.md` 加密落盘。
 - 初始化后通过 `otAQ7b` batch RPC 动态发现当前账号可用模型，并从账号层级能力计算模型选择头；未指定模型的网页请求可能只返回文本，因此不能跳过这一步或硬编码易漂移的模型 ID。
 - 参考图通过 `content-push.googleapis.com/upload` 的 multipart `file` 字段上传，请求携带 `X-Tenant-Id` 与 Push-ID，响应正文作为文件引用。
 - 生成前发送 `ESY5D` 活动预热；文本与文件引用随后组装成当前 69 槽 `StreamGenerate` 请求。响应按 Google 长度帧解析，只接受生成图位置，不接受输入附件或网页搜索图。
@@ -56,6 +56,37 @@
 输出目录只包含两次生成的图片和 `gemini-web-protocol-summary.scrubbed.json`。摘要仅记录布尔值、计数和 MIME 类型，不记录 Cookie、完整请求头、原始响应、邮箱、账号 ID、XSRF、RPC ID、上传 token、下载 URL、提示词或文件路径。图生图输出会与输入文件按内存摘要比较；完全相同则探测失败。Backend 仍只接收 `generated_image` 候选，因此现有 fixture 可验证输入附件和网页搜索图不会作为输出。
 
 工具不保存原始网络 capture。若 Adapter 返回 `upstream_protocol_error`，只能使用上述已授权的计数诊断或另行取得用户授权；不能把失败响应打印或写入仓库。
+
+## MVP 端到端验收
+
+工单 #16 固化独立验收脚本。无凭据模式只使用仓库内的脱敏 fixture，不读取 Cookie、不创建输出文件，也不会访问网络：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\gemini_web_mvp_acceptance.py dry-run
+```
+
+真实模式覆盖正式账号管理路由、公开 OpenAI 图片接口和官方 OpenAI Python 客户端。真实运行属于工单 #19，必须等 #19 成为当前 frontier、取得当次明确授权并由用户指定三个仓库外路径后执行。脚本只把 Cookie 保存在进程内存中，图片和脱敏摘要只写入指定的仓库外目录：
+
+```powershell
+py -3.10 -m uv run --with openai python scripts\gemini_web_mvp_acceptance.py `
+  live `
+  --cookie-file '<仓库外 Cookie JSON 的绝对路径>' `
+  --reference-image '<仓库外参考图的绝对路径>' `
+  --output-dir '<仓库外输出目录的绝对路径>' `
+  --acknowledge-live-probe
+```
+
+验收顺序固定为：正式导入、列表脱敏检查、验证、禁用及 503 防护、恢复；随后通过原生 OpenAI 兼容 HTTP 与官方 OpenAI Python 客户端各执行一次文生图和图生图，并交叉验证 `b64_json` 与 `url`。输出摘要固定为 `gemini-web-mvp-acceptance.scrubbed.json`，只记录布尔值、调用计数、响应格式和公开状态码，不记录 Cookie、完整请求头、原始响应、URL、路径或账号标识。
+
+Cookie 的短期轮换可能使刚完成一次真实探测的仓库外快照失效。尚未进入正式账号存储的临时快照若返回 `no_available_account`，必须由用户重新导出同一路径的 Cookie；不得从浏览器配置中读取，也不得把内存轮换值写回输入文件。正式导入成功后，后台维护和真实请求会自动把刷新值写回加密账号存储，后续请求使用该登录态。
+
+## 可靠性与公开错误合同
+
+- 一次生成或编辑只创建一个基于 `time.monotonic()` 的绝对截止时间；等待账号、初始化、逐张上传、生成、换号和逐张下载只接收剩余预算，换号不会重置计时。
+- 本轮已取得的稳定 `account_id` 会立即加入排除集合，因此每个账号最多尝试一次。Cookie 失效会标记账号异常后换号，429 会直接换号，二者均保持原有 `503 no_available_account` 与 `429 upstream_rate_limited` 耗尽合同，也不触发任何额度查询或持久化。
+- HTTP 5xx 表示当前账号链路的临时上游失败，可换号；所有候选账号都临时失败后使用现有 `503 no_available_account`，因为当前请求已没有可完成调用的账号，且既定公开错误集合没有另设上游不可用码。
+- 协议解析失败、缺少生成候选或非法图片内容仍是终止性的 `502 upstream_protocol_error`，不会被误当成临时失败而盲目换号；总截止时间耗尽仍为 `504 upstream_timeout`。
+- 账号槽位在 `finally` 中释放，测试覆盖成功、Cookie 失效换号、限流换号、临时失败换号、上传失败、下载失败、协议失败、取消和总时长超时。
 
 ## fixture 进入仓库前
 

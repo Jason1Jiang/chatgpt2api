@@ -280,6 +280,7 @@ class DownloadedImage:
 class GeminiTransportFailureKind(StrEnum):
     TIMEOUT = "timeout"
     RATE_LIMIT = "rate_limit"
+    TEMPORARY = "temporary"
     INVALID_COOKIE = "invalid_cookie"
     CONTENT_POLICY = "content_policy"
     PROTOCOL = "protocol"
@@ -638,6 +639,7 @@ def _parse_current_generation_stream(
 _TRANSPORT_ERROR_MAP = {
     GeminiTransportFailureKind.TIMEOUT: GeminiWebErrorCode.UPSTREAM_TIMEOUT,
     GeminiTransportFailureKind.RATE_LIMIT: GeminiWebErrorCode.UPSTREAM_RATE_LIMITED,
+    GeminiTransportFailureKind.TEMPORARY: GeminiWebErrorCode.NO_AVAILABLE_ACCOUNT,
     GeminiTransportFailureKind.INVALID_COOKIE: GeminiWebErrorCode.NO_AVAILABLE_ACCOUNT,
     GeminiTransportFailureKind.CONTENT_POLICY: GeminiWebErrorCode.CONTENT_POLICY_VIOLATION,
     GeminiTransportFailureKind.PROTOCOL: GeminiWebErrorCode.UPSTREAM_PROTOCOL_ERROR,
@@ -821,7 +823,10 @@ class GeminiWebBackend:
                             ) from None
                     retry_failures.append(error.kind)
                     continue
-                if error.kind == GeminiTransportFailureKind.RATE_LIMIT:
+                if error.kind in {
+                    GeminiTransportFailureKind.RATE_LIMIT,
+                    GeminiTransportFailureKind.TEMPORARY,
+                }:
                     retry_failures.append(error.kind)
                     continue
                 raise self._public_error(error) from None
@@ -886,6 +891,8 @@ def _raise_for_status(response: Any) -> None:
         raise GeminiTransportFailure(GeminiTransportFailureKind.INVALID_COOKIE)
     if status_code == 429:
         raise GeminiTransportFailure(GeminiTransportFailureKind.RATE_LIMIT)
+    if 500 <= status_code < 600:
+        raise GeminiTransportFailure(GeminiTransportFailureKind.TEMPORARY)
     if status_code < 200 or status_code >= 300:
         raise GeminiTransportFailure(GeminiTransportFailureKind.PROTOCOL)
 
