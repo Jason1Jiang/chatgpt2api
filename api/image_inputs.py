@@ -305,5 +305,5 @@ async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:
             continue
         images.append(await run_in_threadpool(_download_image_url, source))
     if not images:
-        raise HTTPException(status_code=400, detail={"error": "image file or image_url is required"})
+        raise HTTPException(status_code=400, detail={"error": "image is required"})
     return images
