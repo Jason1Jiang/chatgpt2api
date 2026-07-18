@@ -123,6 +123,58 @@ class GeminiWebAccountPool(Protocol):
     ) -> None: ...
 
 
+class FirstNormalGeminiWebAccountPool:
+    """Small Adapter used by the fixture-backed generation integration tests.
+
+    Credentials stay behind AccountService.get_account(); the public account
+    listing is used only to choose a stable account_id. Production requests use
+    PersistedGeminiWebAccountPool below.
+    """
+
+    def __init__(
+        self,
+        *,
+        list_accounts: Callable[[], list[dict[str, Any]]],
+        get_account: Callable[[str], dict[str, Any] | None],
+    ) -> None:
+        self._list_accounts = list_accounts
+        self._get_account = get_account
+
+    def acquire(
+        self,
+        *,
+        excluded_account_ids: set[str] | None = None,
+        deadline: float | None = None,
+    ) -> GeminiWebAccount:
+        excluded = excluded_account_ids or set()
+        for item in self._list_accounts():
+            if str(item.get("provider") or "").strip().lower() != "gemini_web":
+                continue
+            if str(item.get("status") or "").strip() != "正常":
+                continue
+            account_id = str(item.get("account_id") or "").strip()
+            if account_id in excluded:
+                continue
+            account = self._get_account(account_id) if account_id else None
+            if account is not None:
+                return GeminiWebAccount.from_mapping(account)
+            break
+        raise GeminiWebError(GeminiWebErrorCode.NO_AVAILABLE_ACCOUNT)
+
+    def release(self, account: GeminiWebAccount) -> None:
+        return None
+
+    def mark_invalid(self, account: GeminiWebAccount) -> None:
+        return None
+
+    def persist_refreshed_cookies(
+        self,
+        account: GeminiWebAccount,
+        cookies: Mapping[str, str],
+    ) -> None:
+        return None
+
+
 class PersistedGeminiWebAccountPool:
     """Adapter from the backend account-pool seam to AccountService."""
 
@@ -1514,4 +1566,22 @@ def create_gemini_web_validation_backend() -> GeminiWebBackend:
         account_pool=_ValidationOnlyAccountPool(),
         transport=HttpGeminiWebTransport(),
         downloader=HttpResultDownloader(),
+    )
+
+
+def create_gemini_web_generation_backend() -> GeminiWebBackend:
+    """Build the production Adapter graph for one Gemini Web image request."""
+    from services.account_service import account_service
+    from services.config import config
+
+    return GeminiWebBackend(
+        account_pool=PersistedGeminiWebAccountPool(
+            acquire_account=account_service.acquire_gemini_web_account,
+            release_slot=account_service.release_image_slot,
+            mark_invalid_account=account_service.mark_gemini_web_account_invalid,
+            persist_refreshed_cookies=account_service.persist_gemini_web_cookies,
+        ),
+        transport=HttpGeminiWebTransport(),
+        downloader=HttpResultDownloader(),
+        timeout_seconds=config.image_poll_timeout_secs,
     )
