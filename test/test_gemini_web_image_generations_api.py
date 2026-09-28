@@ -338,7 +338,7 @@ class GeminiWebImageModelDiscoveryTests(unittest.TestCase):
                 return_value={"id": "test-user", "role": "admin"},
             ),
             mock.patch.object(
-                openai_v1_models.OpenAIBackendAPI,
+                openai_v1_models.model_catalog_service,
                 "list_models",
                 return_value={
                     "object": "list",
@@ -370,7 +370,7 @@ class GeminiWebImageModelDiscoveryTests(unittest.TestCase):
             [_gemini_account("gemini_web:abnormal-only", status="异常")],
         ):
             with self.subTest(accounts=accounts), mock.patch.object(
-                openai_v1_models.OpenAIBackendAPI,
+                openai_v1_models.model_catalog_service,
                 "list_models",
                 return_value={
                     "object": "list",

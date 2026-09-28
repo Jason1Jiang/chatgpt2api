@@ -4,6 +4,7 @@ import mimetypes
 import os
 import random
 import re
+import threading
 import time
 
 import urllib.error
@@ -16,7 +17,7 @@ from collections.abc import Callable
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import unquote, urlparse
 
-from curl_cffi import requests
+from curl_cffi import CurlECode, CurlOpt, requests
 from PIL import Image
 
 from services.account_service import account_service
@@ -32,7 +33,15 @@ class InvalidAccessTokenError(RuntimeError):
     pass
 
 
-class ImagePollTimeoutError(RuntimeError):
+class ImageTaskError(RuntimeError):
+    """图片生成异常基类，携带上游会话 ID 供调用方清理对话。"""
+
+    def __init__(self, message: str = "", conversation_id: str = "") -> None:
+        super().__init__(message)
+        self.conversation_id = conversation_id
+
+
+class ImagePollTimeoutError(ImageTaskError):
     pass
 
 
@@ -42,7 +51,7 @@ class ImageStreamTimeoutError(RuntimeError):
         super().__init__(f"image generation stream timed out after {self.timeout_secs:g} seconds")
 
 
-class ImageContentPolicyError(RuntimeError):
+class ImageContentPolicyError(ImageTaskError):
     """Raised when image generation is blocked by content policy moderation."""
     pass
 
@@ -502,9 +511,9 @@ class OpenAIBackendAPI:
     @staticmethod
     def _normalize_thinking_effort(value: str) -> str:
         normalized = str(value or "").strip().lower()
-        if normalized in {"", "none"}:
+        if normalized in {"", "none", "auto"}:
             return ""
-        if normalized in {"low", "medium", "high"}:
+        if normalized in {"low", "medium", "high", "standard", "max"}:
             return normalized
         if normalized in {"xhigh", "extended"}:
             return "extended"
@@ -548,21 +557,26 @@ class OpenAIBackendAPI:
                 "screen_width": 2560,
             },
         }
-        normalized_effort = self._normalize_thinking_effort(thinking_effort)
+        normalized_effort = self._normalize_thinking_effort(thinking_effort or config.default_thinking_effort)
         if normalized_effort:
             payload["thinking_effort"] = normalized_effort
         return payload
 
-    def _image_model_slug(self, model: str) -> str:
-        """把标准图片模型名映射到底层 model slug。"""
+    def _image_model_settings(self, model: str) -> tuple[str, str]:
+        """把标准图片模型名映射为上游模型及思考强度。"""
         _, base_model = split_image_model(model)
         if not base_model:
-            return "auto"
+            return "auto", ""
         if base_model == "gpt-image-2":
-            return "gpt-5-3"
-        if base_model == CODEX_IMAGE_MODEL:
-            return base_model
-        return "auto"
+            upstream_model = config.default_upstream_model_name
+        elif base_model == CODEX_IMAGE_MODEL:
+            upstream_model = base_model
+        else:
+            return "auto", ""
+        model_name, separator, suffix = upstream_model.rpartition("-")
+        if separator and suffix.lower() in {"standard", "extended", "max"}:
+            return model_name, suffix.lower()
+        return upstream_model, self._normalize_thinking_effort(config.default_thinking_effort)
 
     def _image_headers(self, path: str, requirements: ChatRequirements, conduit_token: str = "", accept: str = "*/*") -> \
             Dict[str, str]:
@@ -851,11 +865,12 @@ class OpenAIBackendAPI:
     def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
         """为图片生成准备 conduit token。"""
         path = "/backend-api/f/conversation/prepare"
+        upstream_model, thinking_effort = self._image_model_settings(model)
         payload = {
             "action": "next",
             "fork_from_shared_post": False,
             "parent_message_id": new_uuid(),
-            "model": self._image_model_slug(model),
+            "model": upstream_model,
             "client_prepare_state": "success",
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
@@ -870,6 +885,8 @@ class OpenAIBackendAPI:
             "supported_encodings": ["v1"],
             "client_contextual_info": {"app_name": "chatgpt.com"},
         }
+        if thinking_effort:
+            payload["thinking_effort"] = thinking_effort
         response = self.session.post(
             self.base_url + path,
             headers=self._image_headers(path, requirements),
@@ -957,6 +974,7 @@ class OpenAIBackendAPI:
                                 references: Optional[list[Dict[str, Any]]] = None,
                                 timeout_secs: float = 300.0) -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
+        upstream_model, thinking_effort = self._image_model_settings(model)
         references = references or []
         parts = [{
             "content_type": "image_asset_pointer",
@@ -994,7 +1012,7 @@ class OpenAIBackendAPI:
                 "metadata": metadata,
             }],
             "parent_message_id": new_uuid(),
-            "model": self._image_model_slug(model),
+            "model": upstream_model,
             "client_prepare_state": "sent",
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
@@ -1016,14 +1034,27 @@ class OpenAIBackendAPI:
             "paragen_cot_summary_display_override": "allow",
             "force_parallel_switch": "auto",
         }
+        if thinking_effort:
+            payload["thinking_effort"] = thinking_effort
         path = "/backend-api/f/conversation"
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
-            json=payload,
-            timeout=timeout_secs,
-            stream=True,
-        )
+        # curl_cffi's scalar timeout only sets connect/low-speed limits for
+        # streams. close() can itself wait for the transfer, so enforce a total
+        # deadline in libcurl too, including time spent waiting for headers.
+        previous_options = self.session.curl_options
+        self.session.curl_options = {
+            **previous_options,
+            CurlOpt.TIMEOUT_MS: max(1, int(timeout_secs * 1000)),
+        }
+        try:
+            response = self.session.post(
+                self.base_url + path,
+                headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+                json=payload,
+                timeout=timeout_secs,
+                stream=True,
+            )
+        finally:
+            self.session.curl_options = previous_options
         ensure_ok(response, path)
         return response
 
@@ -2245,7 +2276,7 @@ class OpenAIBackendAPI:
                         "attempt": attempt,
                         "error_msg": policy_msg[:200],
                     })
-                    raise ImageContentPolicyError(policy_msg)
+                    raise ImageContentPolicyError(policy_msg, conversation_id or "")
 
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})
@@ -2291,11 +2322,11 @@ class OpenAIBackendAPI:
         exc = ImagePollTimeoutError(
             f"ChatGPT 生图超时（已等待 {timeout_secs} 秒）。"
             f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
-            f"也可能是账号被限流或生图队列拥堵导致。"
+            f"也可能是账号被限流或生图队列拥堵导致。",
+            conversation_id or "",
         )
         if last_task_error:
             setattr(exc, "task_error", last_task_error)
-        setattr(exc, "conversation_id", conversation_id or "")
         raise exc
 
     def _get_file_download_url(self, file_id: str) -> str:
@@ -2505,7 +2536,7 @@ class OpenAIBackendAPI:
                 task_error = getattr(exc, "task_error", "")
                 if not file_ids and not sediment_ids:
                     if task_error:
-                        raise ImageContentPolicyError(task_error) from exc
+                        raise ImageContentPolicyError(task_error, conversation_id or "") from exc
                     raise
                 logger.warning({
                     "event": "image_resolve_poll_partial_timeout",
@@ -2607,18 +2638,54 @@ class OpenAIBackendAPI:
             )
         except (requests.exceptions.Timeout, TimeoutError) as exc:
             raise ImageStreamTimeoutError(stream_timeout_secs) from exc
+        except requests.exceptions.RequestException as exc:
+            # Streaming requests can surface curl timeouts as the base error.
+            if exc.code == CurlECode.OPERATION_TIMEDOUT:
+                raise ImageStreamTimeoutError(stream_timeout_secs) from exc
+            raise
         self._report_progress("generating")
         remaining_secs = stream_timeout_secs - (time.monotonic() - stream_started_at)
         if remaining_secs <= 0:
             response.close()
             raise ImageStreamTimeoutError(stream_timeout_secs)
+        expired = threading.Event()
+
+        def close_timed_out_stream() -> None:
+            expired.set()
+            try:
+                response.close()
+            except Exception:
+                pass
+
+        # A silent upstream can block iter_lines(), so checking each line alone
+        # cannot enforce the deadline. Close the connection from a watchdog too.
+        watchdog = threading.Timer(remaining_secs, close_timed_out_stream)
+        watchdog.daemon = True
+        watchdog.start()
         try:
             try:
                 yield from iter_sse_payloads(response, max_duration_secs=remaining_secs)
-            except TimeoutError as exc:
-                raise ImageStreamTimeoutError(stream_timeout_secs) from exc
+            except Exception as exc:
+                if (
+                    expired.is_set()
+                    or isinstance(exc, (requests.exceptions.Timeout, TimeoutError))
+                    or (
+                        isinstance(exc, requests.exceptions.RequestException)
+                        and exc.code == CurlECode.OPERATION_TIMEDOUT
+                    )
+                    or time.monotonic() - stream_started_at >= stream_timeout_secs
+                ):
+                    raise ImageStreamTimeoutError(stream_timeout_secs) from exc
+                raise
+            # Closing a timed-out stream can also produce clean EOF.
+            if expired.is_set() or time.monotonic() - stream_started_at >= stream_timeout_secs:
+                raise ImageStreamTimeoutError(stream_timeout_secs)
         finally:
-            response.close()
+            watchdog.cancel()
+            try:
+                response.close()
+            except Exception:
+                pass
 
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""

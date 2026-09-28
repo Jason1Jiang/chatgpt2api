@@ -4,16 +4,12 @@ from typing import Any
 
 from services.account_service import account_service
 from services.gemini_web_backend import GEMINI_WEB_IMAGE_MODEL
-from services.openai_backend_api import OpenAIBackendAPI
+from services.model_service import model_catalog_service
 from utils.helper import CODEX_IMAGE_MODEL
 
 
 def list_models() -> dict[str, Any]:
-    backend = OpenAIBackendAPI()
-    try:
-        result = backend.list_models()
-    finally:
-        backend.close()
+    result = model_catalog_service.list_models()
     data = result.get("data")
     if not isinstance(data, list):
         return result
